@@ -4,17 +4,13 @@ import logging
 import logging.config
 import random
 import string
+import sys
 
 import yaml
 from kubeflow.pytorchjob import (PyTorchJobClient, V1PyTorchJob,
-                                 V1PyTorchJobSpec, V1ReplicaSpec, constants,
-                                 utils)
-from kubeflow.pytorchjob.constants import constants
-
+                                 V1PyTorchJobSpec, V1ReplicaSpec, utils)
 from kubernetes import watch
-from kubernetes.client import (V1Container, V1ObjectMeta, V1PodSpec,
-                               V1PodTemplateSpec, V1ResourceRequirements,
-                               V1VolumeMount, V1Pod)
+from kubernetes.client import V1ObjectMeta, V1Pod, V1PodTemplateSpec
 
 with open('./logging.yaml', 'r', encoding='utf-8') as f:
     logging.config.dictConfig(yaml.safe_load(f))
@@ -23,20 +19,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 def yamlOrJsonStr(str):
-    if str == "" or str == None:
+    if str == "" or str is None:
         return None
     return yaml.safe_load(str)
 
 
-def launch_job(pod_spec: dict,
-               job_name='pytorch-operation-job',
-               namespace='kubeflow',
-               worker_num=0,
-               wait_for_startup=1800):
-    """
-    Launch PyTorchJob on kubeflow pipeline
+def _create_pytorchjob(pod_spec: dict,
+                       job_name='pytorch-operation-job',
+                       namespace='kubeflow',
+                       worker_num=0):
 
-    """
     disbale_istio_injection = {
         'sidecar.istio.io/inject': "false"
     }
@@ -61,7 +53,7 @@ def launch_job(pod_spec: dict,
         )
         replica_spec['Worker'] = worker
 
-    pytorchjob = V1PyTorchJob(
+    return V1PyTorchJob(
         api_version="kubeflow.org/v1",
         kind="PyTorchJob",
         metadata=V1ObjectMeta(name=job_name, namespace=namespace),
@@ -71,15 +63,29 @@ def launch_job(pod_spec: dict,
         )
     )
 
-    client = PyTorchJobClient()
-    ret = client.create(pytorchjob)
+
+def launch_job(client: PyTorchJobClient, job: V1PyTorchJob):
+    """
+    Launch PyTorchJob on kubeflow pipeline
+
+    """
+
+    ret = client.create(job)  # type: V1PyTorchJob
     LOGGER.info('Launch PyTorchJob %s', ret)
-    client.wait_for_condition(job_name,
-                              'Created',
-                              namespace=namespace,
-                              timeout_seconds=1800,
-                              polling_interval=60,
-                              status_callback=lambda x: LOGGER.debug('PyTorchJob Conditions: %s', x.get("status", {}).get("conditions", [])))
+    job_name = ret.metadata.name
+    namespace = ret.metadata.namespace
+    job = client.wait_for_condition(job_name,
+                                    ['Created', 'Failed'],
+                                    namespace=namespace,
+                                    status_callback=lambda x: LOGGER.debug('PyTorchJob Conditions\n %s', x.get("status", {}).get("conditions", ['None Condition'])[-1]))
+
+    if job.get("status", {}).get("conditions", [])[0]['type'] == 'Failed':
+        LOGGER.error('Cancel PytorchJob: %s', job_name)
+        LOGGER.error('Unexpected condition. Could you confirm below ?')
+        LOGGER.error(job)
+
+        sys.exit(1)
+
     LOGGER.info('PyTorchJob created: %s', job_name)
     for _pname in client.get_pod_names(job_name, namespace=namespace):
         LOGGER.info('Pod name: %s', _pname)
@@ -93,20 +99,29 @@ def launch_job(pod_spec: dict,
     labels = utils.get_labels(job_name, master=True)
     LOGGER.info('wait till pod running. target selector: %s', labels)
     w = watch.Watch()
+    last_pod_info = None
     for event in w.stream(client.core_api.list_namespaced_pod,
                           namespace,
                           label_selector=utils.to_selector(labels)):
-        pod = event['object']  # type: V1Pod
-        LOGGER.debug("Event: %s %s %s",
+        last_pod_info = event['object']  # type: V1Pod
+        LOGGER.debug("Event: %s %s %s %s",
                      event['type'],
-                     pod.metadata.name,
-                     pod.status.phase,
-                     pod.status.conditions[-1] if len(pod.status.conditions) > 0 else 'none')
+                     last_pod_info.metadata.name,
+                     last_pod_info.status.phase,
+                     last_pod_info.status.conditions[-1] if len(last_pod_info.status.conditions) > 0 else 'none')
 
-        if pod.status.phase in ['Succeeded', 'Failed', 'Unknown'] or (pod.status.phase == 'Running' and
-                                                                      len(pod.status.conditions) > 0 and
-                                                                      pod.status.conditions[-1].type == 'PodScheduled'):
+        if last_pod_info.status.phase in ['Succeeded', 'Failed', 'Unknown'] or (last_pod_info.status.phase == 'Running' and
+                                                                                len(last_pod_info.status.conditions) > 0 and
+                                                                                last_pod_info.status.conditions[-1].type == 'PodScheduled'):
             w.stop()
+
+    if last_pod_info.status.phase in ['Failed', 'Unknown']:
+        LOGGER.error('Cancel PytorchJob: %s', job_name)
+        LOGGER.error('master pod status: %s', last_pod_info.status.phase)
+        LOGGER.error('Could you confirm below ?')
+        LOGGER.error(last_pod_info)
+
+        sys.exit(1)
 
     LOGGER.info('start watch PyTorchJob Pods log')
     for line in client.core_api.read_namespaced_pod_log(master_pod_name,
@@ -152,7 +167,8 @@ if __name__ == "__main__":
     LOGGER.debug(args)
 
     try:
-        launch_job(**args)
+        job = _create_pytorchjob(**args)
+        launch_job(PyTorchJobClient(), job)
     except Exception as e:
         LOGGER.exception('Unexpected Error')
         raise e
