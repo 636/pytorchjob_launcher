@@ -72,8 +72,8 @@ def launch_job(client: PyTorchJobClient, job: V1PyTorchJob):
 
     ret = client.create(job)  # type: V1PyTorchJob
     LOGGER.info('Launch PyTorchJob %s', ret)
-    job_name = ret.metadata.name
-    namespace = ret.metadata.namespace
+    job_name = ret['metadata']['name']
+    namespace = ret['metadata']['namespace']
     job = client.wait_for_condition(job_name,
                                     ['Created', 'Failed'],
                                     namespace=namespace,
