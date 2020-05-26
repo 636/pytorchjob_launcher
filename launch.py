@@ -3,14 +3,16 @@ import datetime
 import logging
 import logging.config
 import random
+import signal
 import string
 import sys
 
 import yaml
-from kubeflow.pytorchjob import (PyTorchJobClient, V1PyTorchJob,
-                                 V1PyTorchJobSpec, V1ReplicaSpec, utils)
 from kubernetes import watch
 from kubernetes.client import V1ObjectMeta, V1Pod, V1PodTemplateSpec
+
+from kubeflow.pytorchjob import (PyTorchJobClient, V1PyTorchJob,
+                                 V1PyTorchJobSpec, V1ReplicaSpec, utils)
 
 with open('./logging.yaml', 'r', encoding='utf-8') as f:
     logging.config.dictConfig(yaml.safe_load(f))
@@ -64,6 +66,15 @@ def _create_pytorchjob(pod_spec: dict,
     )
 
 
+def _get_delete_pytorch_job_func(client: PyTorchJobClient, job_name, namespace):
+
+    def _(signal_number=0, frame=None):
+        LOGGER.info('delete pytorch job. signal code: %s', signal_number)
+        client.delete(job_name, namespace=namespace)
+
+    return _
+
+
 def launch_job(client: PyTorchJobClient, job: V1PyTorchJob):
     """
     Launch PyTorchJob on kubeflow pipeline
@@ -74,10 +85,13 @@ def launch_job(client: PyTorchJobClient, job: V1PyTorchJob):
     LOGGER.info('Launch PyTorchJob %s', ret)
     job_name = ret['metadata']['name']
     namespace = ret['metadata']['namespace']
-    job = client.wait_for_condition(job_name,
-                                    ['Created', 'Failed'],
-                                    namespace=namespace,
-                                    status_callback=lambda x: LOGGER.debug('PyTorchJob Conditions\n %s', x.get("status", {}).get("conditions", ['None Condition'])[-1]))
+
+    LOGGER.debug('setup sigterm handler')
+    delete_job_func = _get_delete_pytorch_job_func(client, job_name, namespace)
+    signal.signal(signal.SIGTERM, delete_job_func)
+
+    job = client.wait_for_condition(job_name, ['Created', 'Failed'], namespace=namespace, status_callback=lambda x: LOGGER.debug(
+        'PyTorchJob Conditions\n %s', x.get("status", {}).get("conditions", ['None Condition'])[-1]))
 
     if job.get("status", {}).get("conditions", [])[0]['type'] == 'Failed':
         LOGGER.error('Cancel PytorchJob: %s', job_name)
@@ -134,7 +148,7 @@ def launch_job(client: PyTorchJobClient, job: V1PyTorchJob):
     client.wait_for_job(job_name, namespace=namespace)
 
     LOGGER.info('Delete PyTorchJob')
-    client.delete(job_name, namespace=namespace)
+    delete_job_func()
 
     LOGGER.info('Launched job finished')
 
